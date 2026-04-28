@@ -1,25 +1,16 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
-// Gemini API 基础 URL
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
-
-// 从环境变量获取配置
 const AUTH_KEY = Deno.env.get("key"); 
 const GEMINI_API_KEYS_STR = Deno.env.get("apikey"); 
 
-// 解析多个 API Keys
 let GEMINI_API_KEYS: string[] = [];
 if (GEMINI_API_KEYS_STR) {
-  GEMINI_API_KEYS = GEMINI_API_KEYS_STR
-    .split(',')
-    .map(key => key.trim())
-    .filter(key => key.length > 0);
+  GEMINI_API_KEYS = GEMINI_API_KEYS_STR.split(',').map(key => key.trim()).filter(key => key.length > 0);
 }
 
 function getRandomApiKey(): string {
-  if (GEMINI_API_KEYS.length === 0) {
-    throw new Error("没有可用的 API Key");
-  }
+  if (GEMINI_API_KEYS.length === 0) throw new Error("没有可用的 API Key");
   return GEMINI_API_KEYS[Math.floor(Math.random() * GEMINI_API_KEYS.length)];
 }
 
@@ -33,61 +24,50 @@ const corsHeaders = {
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   
+  // 1. 处理跨域预检
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
   try {
     if (!AUTH_KEY || GEMINI_API_KEYS.length === 0) {
-      return new Response(JSON.stringify({ error: "服务器环境变量(key或apikey)未正确配置" }), { 
-        status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } 
-      });
+      return new Response(JSON.stringify({ error: { message: "服务器环境变量(key或apikey)未正确配置" } }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
+    // 2. 身份验证
     let clientKey = "";
     const authHeader = req.headers.get("Authorization");
     if (authHeader) clientKey = authHeader.replace(/^Bearer\s+/i, "").trim();
     else clientKey = req.headers.get("x-api-key")?.trim() || url.searchParams.get("key")?.trim() || "";
 
     if (!clientKey || clientKey !== AUTH_KEY) {
-      return new Response(JSON.stringify({ error: "认证失败：无效的 API 密钥" }), { 
-        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } 
-      });
+      return new Response(JSON.stringify({ error: { message: "认证失败：无效的 API 密钥" } }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
     const selectedApiKey = getRandomApiKey();
     
     // ====================================================================
-    // 动态获取 Google 真实的可用模型列表，并转换为 OpenAI 格式
+    // 动态获取 Google 真实模型列表
     // ====================================================================
     if (req.method === "GET" && url.pathname.endsWith("/models")) {
       const geminiModelsUrl = `${GEMINI_API_BASE}/v1beta/models?key=${selectedApiKey}`;
       const response = await fetch(geminiModelsUrl);
       
       if (!response.ok) {
-        return new Response(JSON.stringify({ error: "向 Google 获取模型列表失败" }), { 
-          status: response.status, headers: { ...corsHeaders, "Content-Type": "application/json" } 
-        });
+        return new Response(JSON.stringify({ error: { message: "向 Google 获取模型列表失败" } }), { status: response.status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
       
       const data = await response.json();
-      
-      // 过滤出 gemini 模型，并将其格式化为 OpenAI 客户端期望的样子
       const models = (data.models || [])
         .filter((m: any) => m.name.includes("gemini")) 
         .map((m: any) => ({
-          id: m.name.replace("models/", ""), // 例如将 "models/gemini-1.5-flash" 提取为 "gemini-1.5-flash"
+          id: m.name.replace("models/", ""),
           object: "model",
           created: Math.floor(Date.now() / 1000),
-          owned_by: "google",
-          permission: [],
-          root: m.name.replace("models/", ""),
-          parent: null
+          owned_by: "google"
         }));
 
-      return new Response(JSON.stringify({ object: "list", data: models }), { 
-        headers: { ...corsHeaders, "Content-Type": "application/json" } 
-      });
+      return new Response(JSON.stringify({ object: "list", data: models }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
     // ====================================================================
@@ -95,37 +75,52 @@ async function handler(req: Request): Promise<Response> {
     // ====================================================================
     if (req.method === "POST" && url.pathname.endsWith("/chat/completions")) {
       const openAiReq = await req.json();
-      
-      // 直接使用客户端请求的模型名称，不做任何画蛇添足的映射
       const targetModel = openAiReq.model || "gemini-1.5-flash";
 
       const contents: any[] = [];
-      let system_instruction: any = undefined;
+      let systemInstruction: any = undefined;
 
       for (const msg of openAiReq.messages || []) {
         if (msg.role === "system") {
-          system_instruction = { parts: [{ text: msg.content }] };
+          systemInstruction = { parts: [{ text: msg.content }] };
+          continue;
+        }
+        
+        const role = msg.role === "assistant" ? "model" : "user";
+        const text = msg.content || "";
+
+        if (!text.trim()) continue;
+
+        if (contents.length > 0 && contents[contents.length - 1].role === role) {
+          contents[contents.length - 1].parts[0].text += "\n\n" + text;
         } else {
-          contents.push({
-            role: msg.role === "assistant" ? "model" : "user",
-            parts: [{ text: msg.content }]
-          });
+          contents.push({ role, parts: [{ text }] });
         }
       }
 
-      const geminiBody = {
-        contents,
-        system_instruction,
-        generationConfig: {
-          temperature: openAiReq.temperature,
-          maxOutputTokens: openAiReq.max_tokens,
-          topP: openAiReq.top_p,
-        }
-      };
+      if (contents.length > 0 && contents[0].role !== "user") {
+        contents.unshift({ role: "user", parts: [{ text: " " }] });
+      }
+      if (contents.length === 0) {
+        contents.push({ role: "user", parts: [{ text: " " }] });
+      }
 
+      const geminiBody: any = { contents };
+      if (systemInstruction) geminiBody.systemInstruction = systemInstruction;
+
+      const generationConfig: any = {};
+      if (openAiReq.temperature !== undefined) generationConfig.temperature = openAiReq.temperature;
+      if (openAiReq.max_tokens !== undefined) generationConfig.maxOutputTokens = openAiReq.max_tokens;
+      if (openAiReq.top_p !== undefined) generationConfig.topP = openAiReq.top_p;
+      if (Object.keys(generationConfig).length > 0) geminiBody.generationConfig = generationConfig;
+
+      // 修复点：正确处理 URL 参数拼接 (? 和 & 的问题)
       const isStream = openAiReq.stream === true;
-      const apiAction = isStream ? "streamGenerateContent?alt=sse" : "generateContent";
-      const targetUrl = `${GEMINI_API_BASE}/v1beta/models/${targetModel}:${apiAction}?key=${selectedApiKey}`;
+      const apiAction = isStream ? "streamGenerateContent" : "generateContent";
+      let targetUrl = `${GEMINI_API_BASE}/v1beta/models/${targetModel}:${apiAction}?key=${selectedApiKey}`;
+      if (isStream) {
+        targetUrl += "&alt=sse"; // 修复了这里的拼接符
+      }
 
       const geminiResponse = await fetch(targetUrl, {
         method: "POST",
@@ -134,8 +129,21 @@ async function handler(req: Request): Promise<Response> {
       });
 
       if (!geminiResponse.ok) {
-        const err = await geminiResponse.text();
-        return new Response(err, { status: geminiResponse.status, headers: corsHeaders });
+        const errText = await geminiResponse.text();
+        let errorMessage = errText;
+        try {
+          const errJson = JSON.parse(errText);
+          if (errJson.error && errJson.error.message) {
+            errorMessage = errJson.error.message;
+          }
+        } catch (e) {}
+
+        return new Response(JSON.stringify({
+          error: {
+            message: `Gemini API 报错: ${errorMessage}`,
+            type: "api_error"
+          }
+        }), { status: geminiResponse.status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
       if (!isStream) {
@@ -221,7 +229,7 @@ async function handler(req: Request): Promise<Response> {
     return new Response(geminiResponse.body, { status: geminiResponse.status, headers: { ...corsHeaders, "Content-Type": geminiResponse.headers.get("Content-Type") || "application/json" } });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: "服务器内部错误" }), { 
+    return new Response(JSON.stringify({ error: { message: "中转服务器内部错误: " + (error as Error).message } }), { 
       status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } 
     });
   }
