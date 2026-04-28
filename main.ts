@@ -24,7 +24,7 @@ const corsHeaders = {
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   
-  // 1. 处理跨域预检
+  // 处理跨域预检
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -34,7 +34,7 @@ async function handler(req: Request): Promise<Response> {
       return new Response(JSON.stringify({ error: { message: "服务器环境变量(key或apikey)未正确配置" } }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // 2. 身份验证
+    // 身份验证
     let clientKey = "";
     const authHeader = req.headers.get("Authorization");
     if (authHeader) clientKey = authHeader.replace(/^Bearer\s+/i, "").trim();
@@ -81,20 +81,38 @@ async function handler(req: Request): Promise<Response> {
       let systemInstruction: any = undefined;
 
       for (const msg of openAiReq.messages || []) {
+        // === 核心修复点：安全提取文本内容，兼容字符串和数组格式 ===
+        let extractedText = "";
+        if (typeof msg.content === "string") {
+          extractedText = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          // 处理复杂结构：[{ type: "text", text: "具体内容" }]
+          extractedText = msg.content
+            .filter((item: any) => item.type === "text" && item.text)
+            .map((item: any) => item.text)
+            .join("\n");
+        } else {
+          continue; // 忽略无法解析的异常内容
+        }
+
+        // 处理 system 角色
         if (msg.role === "system") {
-          systemInstruction = { parts: [{ text: msg.content }] };
+          if (extractedText.trim()) {
+            systemInstruction = { parts: [{ text: extractedText }] };
+          }
           continue;
         }
         
         const role = msg.role === "assistant" ? "model" : "user";
-        const text = msg.content || "";
 
-        if (!text.trim()) continue;
+        // 防御性过滤空消息
+        if (!extractedText.trim()) continue;
 
+        // 合并连续的相同角色消息
         if (contents.length > 0 && contents[contents.length - 1].role === role) {
-          contents[contents.length - 1].parts[0].text += "\n\n" + text;
+          contents[contents.length - 1].parts[0].text += "\n\n" + extractedText;
         } else {
-          contents.push({ role, parts: [{ text }] });
+          contents.push({ role, parts: [{ text: extractedText }] });
         }
       }
 
@@ -114,12 +132,11 @@ async function handler(req: Request): Promise<Response> {
       if (openAiReq.top_p !== undefined) generationConfig.topP = openAiReq.top_p;
       if (Object.keys(generationConfig).length > 0) geminiBody.generationConfig = generationConfig;
 
-      // 修复点：正确处理 URL 参数拼接 (? 和 & 的问题)
       const isStream = openAiReq.stream === true;
       const apiAction = isStream ? "streamGenerateContent" : "generateContent";
       let targetUrl = `${GEMINI_API_BASE}/v1beta/models/${targetModel}:${apiAction}?key=${selectedApiKey}`;
       if (isStream) {
-        targetUrl += "&alt=sse"; // 修复了这里的拼接符
+        targetUrl += "&alt=sse";
       }
 
       const geminiResponse = await fetch(targetUrl, {
