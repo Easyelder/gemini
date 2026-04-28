@@ -24,7 +24,6 @@ const corsHeaders = {
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   
-  // 处理跨域预检
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -34,7 +33,6 @@ async function handler(req: Request): Promise<Response> {
       return new Response(JSON.stringify({ error: { message: "服务器环境变量(key或apikey)未正确配置" } }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    // 身份验证
     let clientKey = "";
     const authHeader = req.headers.get("Authorization");
     if (authHeader) clientKey = authHeader.replace(/^Bearer\s+/i, "").trim();
@@ -78,37 +76,30 @@ async function handler(req: Request): Promise<Response> {
       const targetModel = openAiReq.model || "gemini-1.5-flash";
 
       const contents: any[] = [];
-      let systemInstruction: any = undefined;
+      let systemText = ""; 
 
       for (const msg of openAiReq.messages || []) {
-        // === 核心修复点：安全提取文本内容，兼容字符串和数组格式 ===
         let extractedText = "";
         if (typeof msg.content === "string") {
           extractedText = msg.content;
         } else if (Array.isArray(msg.content)) {
-          // 处理复杂结构：[{ type: "text", text: "具体内容" }]
           extractedText = msg.content
             .filter((item: any) => item.type === "text" && item.text)
             .map((item: any) => item.text)
             .join("\n");
         } else {
-          continue; // 忽略无法解析的异常内容
+          continue;
         }
 
-        // 处理 system 角色
         if (msg.role === "system") {
-          if (extractedText.trim()) {
-            systemInstruction = { parts: [{ text: extractedText }] };
-          }
+          if (extractedText.trim()) systemText += extractedText + "\n\n";
           continue;
         }
         
         const role = msg.role === "assistant" ? "model" : "user";
 
-        // 防御性过滤空消息
         if (!extractedText.trim()) continue;
 
-        // 合并连续的相同角色消息
         if (contents.length > 0 && contents[contents.length - 1].role === role) {
           contents[contents.length - 1].parts[0].text += "\n\n" + extractedText;
         } else {
@@ -124,7 +115,13 @@ async function handler(req: Request): Promise<Response> {
       }
 
       const geminiBody: any = { contents };
-      if (systemInstruction) geminiBody.systemInstruction = systemInstruction;
+      
+      if (systemText.trim()) {
+        geminiBody.systemInstruction = {
+          role: "system",
+          parts: [{ text: systemText.trim() }]
+        };
+      }
 
       const generationConfig: any = {};
       if (openAiReq.temperature !== undefined) generationConfig.temperature = openAiReq.temperature;
@@ -156,23 +153,38 @@ async function handler(req: Request): Promise<Response> {
         } catch (e) {}
 
         return new Response(JSON.stringify({
-          error: {
-            message: `Gemini API 报错: ${errorMessage}`,
-            type: "api_error"
-          }
+          error: { message: `Gemini API 报错: ${errorMessage}`, type: "api_error" }
         }), { status: geminiResponse.status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
       if (!isStream) {
         const geminiData = await geminiResponse.json();
-        const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        const openAiResp = {
+        const parts = geminiData.candidates?.[0]?.content?.parts || [];
+        
+        // 🚀 核心修复：精准分离正常回复和思考过程 🚀
+        const text = parts.filter((p: any) => !p.thought).map((p: any) => p.text || "").join("");
+        const reasoningText = parts.filter((p: any) => p.thought).map((p: any) => p.text || "").join("");
+        
+        const openAiResp: any = {
           id: "chatcmpl-" + crypto.randomUUID(),
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: targetModel,
-          choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }]
+          choices: [{ 
+            index: 0, 
+            message: { 
+              role: "assistant", 
+              content: text 
+            }, 
+            finish_reason: "stop" 
+          }]
         };
+
+        // 如果存在思考过程，放入 reasoning_content 字段中
+        if (reasoningText) {
+          openAiResp.choices[0].message.reasoning_content = reasoningText;
+        }
+
         return new Response(JSON.stringify(openAiResp), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
@@ -190,14 +202,24 @@ async function handler(req: Request): Promise<Response> {
               if (dataStr === "[DONE]") continue; 
               try {
                 const data = JSON.parse(dataStr);
-                const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                if (text) {
+                const parts = data.candidates?.[0]?.content?.parts || [];
+                
+                // 🚀 流式处理：同样过滤和分离思考片段 🚀
+                const text = parts.filter((p: any) => !p.thought).map((p: any) => p.text || "").join("");
+                const reasoningText = parts.filter((p: any) => p.thought).map((p: any) => p.text || "").join("");
+                
+                if (text || reasoningText) {
+                  const delta: any = {};
+                  if (text) delta.content = text;
+                  // 将思考过程映射为 OpenAI 规范的 reasoning_content
+                  if (reasoningText) delta.reasoning_content = reasoningText;
+
                   const openAiChunk = {
                     id: "chatcmpl-" + crypto.randomUUID().substring(0, 8),
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model: targetModel,
-                    choices: [{ delta: { content: text }, index: 0, finish_reason: null }]
+                    choices: [{ delta: delta, index: 0, finish_reason: null }]
                   };
                   controller.enqueue(`data: ${JSON.stringify(openAiChunk)}\n\n`);
                 }
